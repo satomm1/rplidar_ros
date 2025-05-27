@@ -172,3 +172,9 @@ Notice: different lidar use different serial_baudrate.
 ## RPLidar frame
 
 RPLidar frame must be broadcasted according to picture shown in rplidar-frame.png
+
+## License
+This package is released under the license found in the [LICENSE file](./LICENSE).
+
+**Author**: 
+- Slamtec
