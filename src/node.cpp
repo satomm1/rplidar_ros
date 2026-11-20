@@ -35,7 +35,9 @@
 #include "ros/ros.h"
 #include "sensor_msgs/LaserScan.h"
 #include "std_srvs/Empty.h"
-#include "sl_lidar.h" 
+#include "sl_lidar.h"
+#include <time.h>
+#include <cmath>
 
 #ifndef _countof
 #define _countof(_Array) (int)(sizeof(_Array) / sizeof(_Array[0]))
@@ -52,6 +54,14 @@ enum {
 using namespace sl;
 
 ILidarDriver * drv = NULL;
+
+// Same clock as the SDK's per-sample timestamps (rp_getus in sdk/src/arch/linux/timer.cpp).
+static sl_u64 monotonicNowUs()
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (sl_u64)t.tv_sec * 1000000ULL + (sl_u64)(t.tv_nsec / 1000);
+}
 
 void publish_scan(ros::Publisher *pub,
                   sl_lidar_response_measurement_node_hq_t *nodes,
@@ -255,6 +265,20 @@ int main(int argc, char * argv[]) {
     nh_private.param<bool>("angle_compensate", angle_compensate, false);
     nh_private.param<std::string>("scan_mode", scan_mode, std::string());
     nh_private.param<std::string>("scan_topic", scan_topic, "scan");
+    // Scan header stamp:
+    //   legacy      - ROS time when the driver started waiting for the scan (original behavior)
+    //   sweep_start - time of the sweep's first sample, from the SDK's per-sample timestamps
+    //   sweep_mid   - sweep_start + half the measured sweep period. Not the ROS convention
+    //                 (first ray), but consumers that do not de-skew (AMCL, gmapping) then
+    //                 match the whole sweep at its mean time instead of its start, which
+    //                 removes the heading bias of about omega * period / 2 while rotating.
+    std::string stamp_mode;
+    nh_private.param<std::string>("stamp_mode", stamp_mode, "legacy");
+    if (stamp_mode != "legacy" && stamp_mode != "sweep_start" && stamp_mode != "sweep_mid") {
+        ROS_WARN("Unknown stamp_mode '%s' (legacy | sweep_start | sweep_mid); using legacy", stamp_mode.c_str());
+        stamp_mode = "legacy";
+    }
+    ROS_INFO("Scan stamp_mode: %s", stamp_mode.c_str());
 
     // Now create the publisher
     ros::Publisher scan_pub = nh.advertise<sensor_msgs::LaserScan>(scan_topic, 1000);
@@ -397,17 +421,55 @@ int main(int argc, char * argv[]) {
     ros::Time end_scan_time;
     double scan_duration;
 
-    
+    // Sweep timing from the SDK (stamp_mode sweep_start / sweep_mid)
+    sl_u64 last_sweep_begin_us = 0;
+    double sweep_period = (scan_frequency > 0.0) ? 1.0 / scan_frequency : 0.1;  // refined from data
+    bool sweep_period_measured = false;
+
     while (ros::ok()) {
         sl_lidar_response_measurement_node_hq_t nodes[8192];
         size_t   count = _countof(nodes);
+        sl_u64 sweep_begin_us = 0;
 
         start_scan_time = ros::Time::now();
-        op_result = drv->grabScanDataHq(nodes, count);
+        op_result = drv->grabScanDataHqWithTimeStamp(nodes, count, sweep_begin_us);
         end_scan_time = ros::Time::now();
+        const sl_u64 grab_done_us = monotonicNowUs();
         scan_duration = (end_scan_time - start_scan_time).toSec();
 
-        if (op_result == SL_RESULT_OK) { 
+        // Stamp and scan_time passed to publish_scan
+        ros::Time scan_stamp = start_scan_time;
+        double scan_period = scan_duration;
+        if (op_result == SL_RESULT_OK && stamp_mode != "legacy") {
+            // Sweep period from consecutive sweep starts; a skipped sweep (about 2x) is not used
+            if (last_sweep_begin_us > 0 && sweep_begin_us > last_sweep_begin_us) {
+                const double dt = (sweep_begin_us - last_sweep_begin_us) * 1e-6;
+                if (!sweep_period_measured) {
+                    if (dt > 0.02 && dt < 0.5) {
+                        sweep_period = dt;
+                        sweep_period_measured = true;
+                    }
+                } else if (std::fabs(dt - sweep_period) < 0.3 * sweep_period) {
+                    sweep_period = 0.9 * sweep_period + 0.1 * dt;
+                }
+            }
+            last_sweep_begin_us = sweep_begin_us;
+
+            const bool begin_valid = sweep_begin_us > 0 && grab_done_us >= sweep_begin_us
+                                     && (grab_done_us - sweep_begin_us) < 1000000ULL;
+            if (begin_valid) {
+                const double age = (grab_done_us - sweep_begin_us) * 1e-6;  // sweep start, seconds ago
+                scan_stamp = end_scan_time - ros::Duration(age);
+                if (stamp_mode == "sweep_mid") {
+                    scan_stamp += ros::Duration(0.5 * sweep_period);
+                }
+                scan_period = sweep_period;
+            } else {
+                ROS_WARN_THROTTLE(10.0, "No valid SDK sweep timestamp; using legacy scan stamp");
+            }
+        }
+
+        if (op_result == SL_RESULT_OK) {
             if(scan_frequency_tunning_after_scan){ //Set scan frequency(For Slamtec Tof lidar)
                 ROS_INFO("set lidar scan frequency to %.1f Hz(%.1f Rpm) ",scan_frequency,scan_frequency*60);
                 drv->setMotorSpeed(scan_frequency*60); //rpm 
@@ -441,7 +503,7 @@ int main(int argc, char * argv[]) {
                     }
   
                     publish_scan(&scan_pub, angle_compensate_nodes, angle_compensate_nodes_count,
-                             start_scan_time, scan_duration, inverted,
+                             scan_stamp, scan_period, inverted,
                              angle_min, angle_max, max_distance,
                              frame_id);
                 } else {
@@ -458,7 +520,7 @@ int main(int argc, char * argv[]) {
                     angle_max = DEG2RAD(getAngle(nodes[end_node]));
 
                     publish_scan(&scan_pub, &nodes[start_node], end_node-start_node +1,
-                             start_scan_time, scan_duration, inverted,
+                             scan_stamp, scan_period, inverted,
                              angle_min, angle_max, max_distance,
                              frame_id);
                }
@@ -467,7 +529,7 @@ int main(int argc, char * argv[]) {
                 float angle_min = DEG2RAD(0.0f);
                 float angle_max = DEG2RAD(359.0f);
                 publish_scan(&scan_pub, nodes, count,
-                             start_scan_time, scan_duration, inverted,
+                             scan_stamp, scan_period, inverted,
                              angle_min, angle_max, max_distance,
                              frame_id);
             }

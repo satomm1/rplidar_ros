@@ -1,6 +1,8 @@
 <launch>
 
   <arg name="scan_topic" default="scan"/>
+  <!-- Scan header stamp: legacy (original) | sweep_start | sweep_mid (see src/node.cpp) -->
+  <arg name="stamp_mode" default="legacy"/>
 
   <node name="rplidarNode"          pkg="rplidar_ros"  type="rplidarNode" output="screen">
   <param name="serial_port"         type="string" value="/dev/ttyUSB0"/>
@@ -9,5 +11,6 @@
   <param name="inverted"            type="bool"   value="false"/>
   <param name="angle_compensate"    type="bool"   value="true"/>
   <param name="scan_topic"         type="string" value="$(arg scan_topic)"/>
+  <param name="stamp_mode"         type="string" value="$(arg stamp_mode)"/>
   </node>
 </launch>
